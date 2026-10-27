@@ -9,6 +9,10 @@ Security policy:
   - Bearer token (Authorization header) OR ?token= required for all
     /api/* paths. Fails closed if DART_RELAY_TOKEN is unset.
   - Only whitelisted DART API paths are proxied (anything else -> 404).
+  - /api/resolve?stock_code=XXXXXX is a local endpoint (same auth):
+    it fetches corpCode.xml server-side and returns only the single
+    matching entry, so the ~10MB list never crosses Vercel's
+    response-size limit (cache-miss fallback for the client).
   - DART API key lives only in server env vars, injected server-side.
     Never in URLs, never in logs (query strings are stripped from logs).
   - Upstream redirects are NOT followed.
@@ -16,11 +20,13 @@ Security policy:
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 
 API_KEY = os.environ.get("DART_API_KEY", "")
@@ -52,6 +58,48 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _corp_code_xml():
+    """Fetch corpCode.xml from DART (server-side), cached 24h in memory.
+
+    The ~10MB list is downloaded by the relay itself; callers never see
+    it, so Vercel's response-size limit is never hit. Returns bytes or
+    None on upstream failure.
+    """
+    now = time.time()
+    hit = _CACHE.get("corpCode.xml")
+    if hit and hit[0] > now:
+        return hit[1]
+    url = UPSTREAM + "/api/corpCode.xml?crtfc_key=" + API_KEY
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        resp = opener.open(req, timeout=25)
+        body = resp.read()
+    except Exception:
+        return None
+    _CACHE["corpCode.xml"] = (now + 86400, body, "application/xml")
+    return body
+
+
+def _find_in_corp_xml(body, stock):
+    """Find one entry by stock_code in a corpCode.xml document.
+
+    Streaming parse (iterparse + elem.clear) keeps memory low and stops
+    as soon as the match is found. Returns the entry dict or None.
+    """
+    ctx = ET.iterparse(io.BytesIO(body), events=("end",))
+    for _, elem in ctx:
+        if elem.tag == "list":
+            s = (elem.findtext("stock_code") or "").strip()
+            if s == stock:
+                code = (elem.findtext("corp_code") or "").strip()
+                name = (elem.findtext("corp_name") or "").strip()
+                return {"stock_code": s, "corp_code": code,
+                        "corp_name": name}
+            elem.clear()
+    return None
+
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, str):
@@ -62,6 +110,31 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_resolve(self, qd):
+        """GET /api/resolve?stock_code=XXXXXX -> single corp_code entry.
+
+        Local endpoint (not a DART path): fetches corpCode.xml
+        server-side, returns only the matching entry as tiny JSON.
+        Auth + rate limiting already applied by do_GET.
+        """
+        stock = (qd.get("stock_code") or "").strip()
+        if not stock:
+            self._send(400, '{"error":"stock_code required"}')
+            return
+        body = _corp_code_xml()
+        if body is None:
+            self._send(502, '{"error":"upstream failed"}')
+            return
+        try:
+            entry = _find_in_corp_xml(body, stock)
+        except Exception:
+            self._send(502, '{"error":"upstream failed"}')
+            return
+        if entry is None:
+            self._send(404, '{"error":"not found"}')
+            return
+        self._send(200, json.dumps(entry, ensure_ascii=False))
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -70,7 +143,10 @@ class handler(BaseHTTPRequestHandler):
         # DART path comes from the vercel.json rewrite (?dart_path=...).
         # Direct calls without the rewrite can also pass ?dart_path=.
         dart_path = qd.get("dart_path") or parsed.path
-        if dart_path not in ALLOWED_PATHS:
+        # /api/resolve is a local endpoint (see _handle_resolve), not a
+        # DART path: it bypasses the allowlist but keeps auth + rate limit.
+        is_resolve = (dart_path == "/api/resolve")
+        if not is_resolve and dart_path not in ALLOWED_PATHS:
             self._send(404, '{"error":"not found"}')
             return
 
@@ -95,6 +171,10 @@ class handler(BaseHTTPRequestHandler):
             self._send(429, '{"error":"rate limited"}')
             return
         _RATE.append(now)
+
+        if is_resolve:
+            self._handle_resolve(qd)
+            return
 
         # --- build upstream request ---
         fwd = [(k, v) for k, v in qs
