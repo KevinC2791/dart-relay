@@ -27,6 +27,7 @@ import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from http.server import BaseHTTPRequestHandler
 
 API_KEY = os.environ.get("DART_API_KEY", "")
@@ -77,6 +78,17 @@ def _corp_code_xml():
         body = resp.read()
     except Exception:
         return None
+    # DART serves corpCode.xml as a ZIP archive containing CORPCODE.xml.
+    if body[:4] == b"PK\x03\x04":
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as zf:
+                name = next((n for n in zf.namelist()
+                             if n.upper().endswith(".XML")), None)
+                if name is None:
+                    return None
+                body = zf.read(name)
+        except Exception:
+            return None
     _CACHE["corpCode.xml"] = (now + 86400, body, "application/xml")
     return body
 
